@@ -10,6 +10,8 @@ export interface TrackData {
 }
 
 const REQUEST_TIMEOUT_MS = 1500;
+const TRACK_VALUE_LIMIT = 200;
+const TRACK_REASON_LIMIT = 255;
 const DEFAULT_GATEWAY = 'https://pinme.dev';
 const DEFAULT_PRODUCT = 'pinme-cli';
 
@@ -27,6 +29,13 @@ const ACTION_OVERRIDES: Record<string, string> = {
   upload_history_viewed: 'view',
   upload_history_cleared: 'click',
   upload_history_failed: 'fail',
+};
+
+const EV_OVERRIDES: Record<string, string> = {
+  upload_success: 'upload',
+  upload_failed: 'upload',
+  project_save_success: 'project_save',
+  project_save_failed: 'project_save',
 };
 
 const TRACK_CHILD_SCRIPT = `
@@ -61,12 +70,15 @@ function shouldDisableTracking(): boolean {
   );
 }
 
-function sanitizeTrackValue(value: unknown): string | undefined {
+function sanitizeTrackValue(
+  value: unknown,
+  maxLength = TRACK_VALUE_LIMIT,
+): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
   }
 
-  return String(value).trim().slice(0, 200);
+  return String(value).trim().slice(0, maxLength);
 }
 
 export function getTrackErrorReason(error: unknown): string {
@@ -115,6 +127,16 @@ function resolveTrackAction(event: string, data: TrackData = {}): string {
   }
 
   return 'view';
+}
+
+function resolveTrackEvent(event: string): string {
+  return EV_OVERRIDES[event] || event;
+}
+
+function resolveTrackReason(
+  data: TrackData,
+): string | undefined {
+  return sanitizeTrackValue(data.re || data.reason, TRACK_REASON_LIMIT);
 }
 
 interface ProjectContext {
@@ -224,6 +246,7 @@ class Tracker {
   ): Record<string, string> {
     const projectContext = resolveProjectContext();
     const action = resolveTrackAction(event, data);
+    const ev = resolveTrackEvent(event);
     const payload: TrackData = {
       ...data,
       u: getUid(),
@@ -231,9 +254,10 @@ class Tracker {
       pd: this.product,
       p: page,
       a: action,
-      ev: event,
+      ev,
       event,
-      project_name: projectContext.projectName,
+      re: resolveTrackReason(data),
+      project_name: projectContext.projectName || data.project_name,
       project_dir: projectContext.projectDir,
       cli_version: version,
       node_version: process.version,
@@ -243,7 +267,10 @@ class Tracker {
 
     const filtered: Record<string, string> = {};
     for (const [key, value] of Object.entries(payload)) {
-      const normalized = sanitizeTrackValue(value);
+      const normalized = sanitizeTrackValue(
+        value,
+        key === 're' ? TRACK_REASON_LIMIT : TRACK_VALUE_LIMIT,
+      );
       if (normalized) {
         filtered[key] = normalized;
       }
