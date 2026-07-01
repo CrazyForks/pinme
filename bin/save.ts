@@ -1,9 +1,19 @@
 import chalk from 'chalk';
+import ora from 'ora';
 import fs from 'fs-extra';
 import path from 'path';
 import axios from 'axios';
 import { execSync } from 'child_process';
 import { getAuthHeaders } from './utils/webLogin';
+import {
+  INSTALL_LOG_FILE,
+  INSTALL_EXITCODE_FILE,
+  INSTALL_PID_FILE,
+  installProjectDependencies,
+  readBackgroundInstallStatus,
+  readBackgroundInstallLogTail,
+  stopBackgroundInstall,
+} from './utils/installProjectDependencies';
 import {
   bindDnsDomainV4,
   bindPinmeDomain,
@@ -14,8 +24,8 @@ import {
   normalizeDomain,
   validateDnsDomain,
 } from './utils/domainValidator';
-import { DependencyInstallError, installProjectDependencies } from './utils/installProjectDependencies';
 import {
+  CliError,
   createApiError,
   createCommandError,
   createConfigError,
@@ -80,57 +90,213 @@ function buildWorker() {
     });
     console.log(chalk.green('Worker built'));
   } catch (error: any) {
+    if (isMissingDependencyError(error)) {
+      throw dependenciesMissingError(
+        'Worker build failed because a required CLI (e.g. `wrangler`) was not found. Project dependencies are missing or incomplete.',
+      );
+    }
     throw createCommandError('worker build', 'npm run build:worker', error, [
       'Fix the build error shown above, then rerun `pinme save`.',
     ]);
   }
 }
 
-// ============ 安装依赖 ============
+// ============ 依赖检查 ============
 
-function installDependencies() {
-  console.log(chalk.blue('Installing dependencies...'));
-
-  // 安装根目录依赖
-
-  // The project template uses npm workspaces. Installing from the root
-  // keeps frontend/backend versions in sync and avoids redundant installs.
-  try {
-    installProjectDependencies(PROJECT_DIR);
-    console.log(chalk.green('Project dependencies installed'));
-  } catch (error: any) {
-    const errorMsg = error.message || '';
-    const installCommand = error instanceof DependencyInstallError
-      ? error.command
-      : 'npm ci/npm install --cache <isolated npm cache> --no-audit --no-fund';
-    
-    // Check for common permission errors
-    if (errorMsg.includes('EACCES') || errorMsg.includes('EPERM') || errorMsg.includes('permission denied')) {
-      throw createCommandError('project dependency install', installCommand, error, [
-        'Permission error detected. Pinme already retries with an isolated npm cache.',
-        'Check whether the project directory is writable:',
-        '  ls -la ' + PROJECT_DIR,
-        'If npm still reports a root-owned cache, set `npm_config_cache` to a user-writable directory and retry.',
-      ]);
-    }
-    
-    // Check for network errors
-    if (errorMsg.includes('ENOTFOUND') || errorMsg.includes('ETIMEDOUT') || errorMsg.includes('network')) {
-      throw createCommandError('project dependency install', installCommand, error, [
-        'Network error detected. Please check:',
-        '  1. Internet connection is available',
-        '  2. npm registry is accessible (https://registry.npmjs.org)',
-        '  3. Try using a mirror: npm config set registry https://registry.npmmirror.com',
-      ]);
-    }
-    
-    // Generic error
-    throw createCommandError('project dependency install', installCommand, error, [
-      'Dependency installation failed.',
-      'Check network connectivity and npm registry availability.',
-      'If `package-lock.json` is stale, update it intentionally with `npm install` before retrying.',
-    ]);
+/**
+ * Build a clear, machine-readable error telling the caller (an AI agent or a
+ * human) that dependencies are missing/incomplete and exactly how to fix it.
+ * `pinme save` no longer installs dependencies itself — `pinme create` kicks off
+ * the install in the background — so this is the single source of truth for the
+ * "deps not ready" condition, whether detected up front or during a build.
+ */
+function dependenciesMissingError(summary: string, logTail?: string): CliError {
+  const installLogPath = path.join(PROJECT_DIR, '.pinme-install.log');
+  const suggestions = [
+    'Run `npm install` in the project root, wait for it to finish, then rerun `pinme save`.',
+  ];
+  if (fs.existsSync(installLogPath)) {
+    suggestions.push(
+      `Background install log: ${installLogPath}`,
+    );
   }
+
+  const error = createConfigError(summary, suggestions);
+  const trimmedTail = logTail?.trim();
+  if (trimmedTail) {
+    error.details = [
+      ...error.details,
+      'Install log (tail):',
+      ...trimmedTail.split('\n').slice(-20),
+    ];
+  }
+  return error;
+}
+
+/**
+ * Detect a build failure that was actually caused by missing dependencies —
+ * typically a CLI such as `wrangler` or `vite` not being on PATH (exit code 127
+ * / "command not found"), or a module that could not be resolved.
+ */
+function isMissingDependencyError(error: any): boolean {
+  const exitCode = error?.status ?? error?.code;
+  if (exitCode === 127) {
+    return true;
+  }
+  const haystack = [error?.message, error?.stderr, error?.stdout]
+    .map((value) => String(value || ''))
+    .join(' ')
+    .toLowerCase();
+  return /command not found|not found|is not recognized|cannot find module|cannot find package/.test(haystack);
+}
+
+/** Required build CLIs: worker build needs `wrangler`, frontend build needs `vite`. */
+function dependenciesPresent(): boolean {
+  return hasLocalBinary('wrangler') && hasLocalBinary('vite');
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const WAIT_FOR_INSTALL_TIMEOUT_MS = 15 * 1000;
+const WAIT_POLL_INTERVAL_MS = 2000;
+
+/**
+ * Ensure dependencies are ready before building.
+ *
+ * `pinme save` no longer installs anything itself — `pinme create` kicks off the
+ * install in the background. So here we:
+ *   - return immediately if the build CLIs are already present;
+ *   - otherwise inspect the background-install markers and, if it is still
+ *     running, WAIT for it to finish with a live spinner (so the user isn't left
+ *     guessing when they can save);
+ *   - throw a clear, machine-readable error if the install failed, timed out, or
+ *     was never started — telling the caller exactly to run `npm install`.
+ */
+async function ensureDependenciesReady(): Promise<void> {
+  if (dependenciesPresent()) {
+    console.log(chalk.gray('Dependencies are installed.'));
+    return;
+  }
+
+  const initial = readBackgroundInstallStatus(PROJECT_DIR);
+
+  if (initial.status === 'idle') {
+    await installDependenciesInForeground();
+    return;
+  }
+
+  if (initial.status === 'failed') {
+    console.log(chalk.yellow(
+      `Background dependency install failed with exit code ${initial.exitCode}. Retrying in this terminal...`,
+    ));
+    await installDependenciesInForeground();
+    return;
+  }
+
+  if (initial.status === 'interrupted') {
+    console.log(chalk.yellow('Background dependency install was interrupted. Continuing in this terminal...'));
+    await installDependenciesInForeground();
+    return;
+  }
+
+  // status === 'running' (or 'success' but CLIs not visible yet) → wait briefly,
+  // then take over in the foreground so the user can see real npm output.
+  const spinner = ora('Waiting briefly for background dependency install...').start();
+  const startedAt = Date.now();
+
+  while (true) {
+    await sleep(WAIT_POLL_INTERVAL_MS);
+
+    if (dependenciesPresent()) {
+      spinner.succeed('Dependencies installed.');
+      return;
+    }
+
+    const state = readBackgroundInstallStatus(PROJECT_DIR);
+
+    if (state.status === 'failed') {
+      spinner.fail('Background dependency install failed.');
+      console.log(chalk.yellow(
+        `Retrying dependency install in this terminal after exit code ${state.exitCode}...`,
+      ));
+      await installDependenciesInForeground();
+      return;
+    }
+
+    if (state.status === 'interrupted') {
+      spinner.fail('Background dependency install was interrupted.');
+      await installDependenciesInForeground();
+      return;
+    }
+
+    if (state.status === 'success') {
+      // Install finished cleanly; trust it even if our CLI probe missed the bins.
+      spinner.succeed('Dependencies installed.');
+      return;
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs > WAIT_FOR_INSTALL_TIMEOUT_MS) {
+      spinner.warn('Background dependency install is not ready yet; continuing in this terminal.');
+      await stopBackgroundInstall(PROJECT_DIR);
+      await installDependenciesInForeground();
+      return;
+    }
+
+    spinner.text = `Waiting briefly for background dependency install... (${Math.round(elapsedMs / 1000)}s)`;
+  }
+}
+
+async function installDependenciesInForeground(): Promise<void> {
+  console.log(chalk.blue('Installing project dependencies...'));
+  try {
+    await stopBackgroundInstall(PROJECT_DIR);
+    await installProjectDependencies(PROJECT_DIR);
+  } catch (error: any) {
+    throw dependenciesMissingError(
+      'Project dependency install failed.',
+      readBackgroundInstallLogTail(PROJECT_DIR) || error?.message,
+    );
+  }
+
+  if (!dependenciesPresent()) {
+    throw dependenciesMissingError(
+      'Project dependencies were installed, but required build CLIs are still missing.',
+      readBackgroundInstallLogTail(PROJECT_DIR),
+    );
+  }
+
+  console.log(chalk.green('Project dependencies installed.'));
+}
+
+/**
+ * Check whether an npm-installed binary is available in any of the workspace
+ * `node_modules/.bin` directories (handles Windows `.cmd`/`.exe` shims too).
+ */
+/** Remove the background-install marker files once they are no longer needed. */
+function cleanupInstallMarkers(): void {
+  try {
+    fs.removeSync(path.join(PROJECT_DIR, INSTALL_LOG_FILE));
+    fs.removeSync(path.join(PROJECT_DIR, INSTALL_EXITCODE_FILE));
+    fs.removeSync(path.join(PROJECT_DIR, INSTALL_PID_FILE));
+  } catch {
+    // Best-effort cleanup; never fail the command over leftover marker files.
+  }
+}
+
+function hasLocalBinary(name: string): boolean {
+  const binDirs = [
+    path.join(PROJECT_DIR, 'node_modules', '.bin'),
+    path.join(PROJECT_DIR, 'backend', 'node_modules', '.bin'),
+    path.join(PROJECT_DIR, 'frontend', 'node_modules', '.bin'),
+  ];
+  const candidates = process.platform === 'win32'
+    ? [name, `${name}.cmd`, `${name}.exe`, `${name}.ps1`]
+    : [name];
+
+  return binDirs.some((dir) => candidates.some((candidate) => fs.existsSync(path.join(dir, candidate))));
 }
 
 function getBuiltWorker(): { workerJsPath: string; modulePaths: string[] } {
@@ -257,6 +423,11 @@ function buildFrontend() {
     });
     console.log(chalk.green('Frontend built'));
   } catch (error: any) {
+    if (isMissingDependencyError(error)) {
+      throw dependenciesMissingError(
+        'Frontend build failed because a required CLI (e.g. `vite`) was not found. Project dependencies are missing or incomplete.',
+      );
+    }
     throw createCommandError('frontend build', 'npm run build:frontend', error, [
       'Fix the frontend build error shown above, then rerun `pinme save`.',
     ]);
@@ -385,7 +556,7 @@ export default async function saveCmd(options: SaveOptions): Promise<void> {
 
     // Backend: build + save
     console.log(chalk.blue('\n--- Backend ---'));
-    installDependencies();
+    await ensureDependenciesReady();
     buildWorker();
 
     const metadata = getMetadata();
@@ -419,6 +590,9 @@ export default async function saveCmd(options: SaveOptions): Promise<void> {
       'management',
     );
     console.log(chalk.green('\nDeployment complete.'));
+    // Dependencies are installed and the deploy succeeded; the install markers
+    // are no longer useful, so clean them up.
+    cleanupInstallMarkers();
     void tracker.trackEvent(TRACK_EVENTS.projectSaveSuccess, TRACK_PAGES.deploy, {
       a: resolveTrackAction(TRACK_EVENTS.projectSaveSuccess),
       project_name: projectName,

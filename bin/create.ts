@@ -4,9 +4,8 @@ import path from 'path';
 import inquirer from 'inquirer';
 import axios from 'axios';
 import AdmZip from 'adm-zip';
-import { execSync } from 'child_process';
 import { getAuthHeaders } from './utils/webLogin';
-import { DependencyInstallError, installProjectDependencies } from './utils/installProjectDependencies';
+import { startBackgroundInstall } from './utils/installProjectDependencies';
 import {
   createApiError,
   createCommandError,
@@ -16,6 +15,9 @@ import {
 import { APP_CONFIG, getPinmeApiUrl } from './utils/config';
 import { uploadPath } from './services/uploadService';
 import { printHighlightedUrl } from './utils/urlDisplay';
+import { patchPrebuiltFrontendDist } from './utils/prebuiltDistConfig';
+import { getValidatedWorkerMetadataContent } from './utils/workerMetadata';
+import { downloadFileWithRetries, getDownloadErrorMessage } from './utils/downloadFile';
 import tracker, { getTrackErrorReason } from './utils/tracker';
 import {
   TRACK_EVENTS,
@@ -210,37 +212,30 @@ export default async function createCmd(options: CreateOptions): Promise<void> {
     console.log(chalk.blue('\n2. Downloading template from repository...'));
     const zipPath = path.join(PROJECT_DIR, 'template.zip');
     const extractDir = path.join(PROJECT_DIR, `.pinme-template-${Date.now()}`);
-    const templateZipUrl = getTemplateZipUrl(TEMPLATE_BRANCH);
-    let downloadSuccess = false;
+    const templateZipUrl =
+      process.env.PINME_TEMPLATE_ZIP_URL || getTemplateZipUrl(TEMPLATE_BRANCH);
     console.log(chalk.gray(`   Template branch: ${TEMPLATE_BRANCH}`));
-    
-    // Retry download up to 3 times
-    for (let attempt = 1; attempt <= 3 && !downloadSuccess; attempt++) {
-      try {
-        console.log(chalk.gray(`   Download attempt ${attempt}/3...`));
-        
-        // Download zip file
-        execSync(`curl -L --retry 3 --retry-delay 2 -o "${zipPath}" "${templateZipUrl}"`, {
-          stdio: 'inherit',
-        });
-        
-        // Check if file was downloaded successfully
-        if (!fs.existsSync(zipPath) || fs.statSync(zipPath).size < 100) {
-          throw new Error('Downloaded file is too small or empty');
-        }
-        
-        downloadSuccess = true;
-      } catch (downloadError: any) {
-        console.log(chalk.yellow(`   Attempt ${attempt} failed: ${downloadError.message}`));
-        if (fs.existsSync(zipPath)) {
-          fs.removeSync(zipPath);
-        }
-        if (attempt === 3) {
-          throw new Error(`Failed to download template after 3 attempts: ${downloadError.message}`);
-        }
-      }
+
+    try {
+      const downloadResult = await downloadFileWithRetries(templateZipUrl, zipPath, {
+        attempts: 3,
+        retryDelayMs: 2000,
+        minBytes: 100,
+        onAttempt: (attempt, attempts) => {
+          console.log(chalk.gray(`   Download attempt ${attempt}/${attempts}...`));
+        },
+        onAttemptFailure: (attempt, error) => {
+          console.log(chalk.yellow(`   Attempt ${attempt} failed: ${getDownloadErrorMessage(error)}`));
+        },
+      });
+      console.log(chalk.green(`   Template archive downloaded (${downloadResult.bytes} bytes)`));
+    } catch (error: any) {
+      throw createCommandError('template download', `download "${templateZipUrl}" to "${zipPath}"`, error, [
+        'Check your network connection and retry `pinme create`.',
+        `Verify that the template branch exists: ${TEMPLATE_BRANCH}`,
+      ]);
     }
-    
+
     try {
       fs.ensureDirSync(extractDir);
 
@@ -256,27 +251,18 @@ export default async function createCmd(options: CreateOptions): Promise<void> {
       fs.removeSync(zipPath);
       fs.removeSync(extractDir);
       
-      // Remove any existing node_modules and package-lock.json to ensure clean install
+      // Remove any existing node_modules to avoid platform-specific dependency leftovers.
       // This fixes issues with rollup platform-specific dependencies
       const nodeModulesPath = path.join(targetDir, 'node_modules');
-      const packageLockPath = path.join(targetDir, 'package-lock.json');
       if (fs.existsSync(nodeModulesPath)) {
         console.log(chalk.gray('   Removing existing node_modules...'));
         fs.removeSync(nodeModulesPath);
       }
-      if (fs.existsSync(packageLockPath)) {
-        console.log(chalk.gray('   Removing existing package-lock.json...'));
-        fs.removeSync(packageLockPath);
-      }
       // Also clean frontend and backend subdirectories
       const frontendNodeModules = path.join(targetDir, 'frontend', 'node_modules');
       const backendNodeModules = path.join(targetDir, 'backend', 'node_modules');
-      const frontendPackageLock = path.join(targetDir, 'frontend', 'package-lock.json');
-      const backendPackageLock = path.join(targetDir, 'backend', 'package-lock.json');
       if (fs.existsSync(frontendNodeModules)) fs.removeSync(frontendNodeModules);
       if (fs.existsSync(backendNodeModules)) fs.removeSync(backendNodeModules);
-      if (fs.existsSync(frontendPackageLock)) fs.removeSync(frontendPackageLock);
-      if (fs.existsSync(backendPackageLock)) fs.removeSync(backendPackageLock);
       
       console.log(chalk.green(`   Template downloaded to: ${targetDir}`));
     } catch (error: any) {
@@ -299,16 +285,17 @@ export default async function createCmd(options: CreateOptions): Promise<void> {
     fs.writeFileSync(configPath, updatedConfig);
     console.log(chalk.green(`   Updated pinme.toml`));
     console.log(chalk.gray(`   metadata: ${workerData.metadata}`));
+    const workerMetadataContent = getValidatedWorkerMetadataContent(
+      workerData.metadata,
+      workerData.project_name,
+    );
+
     // 4. Save metadata to backend directory
     const backendDir = path.join(targetDir, 'backend');
-    if (fs.existsSync(backendDir) && workerData.metadata) {
-      // Save metadata (user needs this for D1 bindings info)
-      const metadataContent = typeof workerData.metadata === 'string'
-        ? workerData.metadata
-        : JSON.stringify(workerData.metadata, null, 2);
+    if (fs.existsSync(backendDir)) {
       fs.writeFileSync(
         path.join(backendDir, 'metadata.json'),
-        metadataContent
+        workerMetadataContent
       );
       console.log(chalk.green(`   Saved metadata.json`));
     }
@@ -378,70 +365,34 @@ export default async function createCmd(options: CreateOptions): Promise<void> {
     fs.writeFileSync(configPath, pinmeConfig);
     console.log(chalk.green(`   Updated pinme.toml with api_url`));
 
-    // 6. Install dependencies
-    console.log(chalk.blue('\n4. Installing dependencies...'));
-
-    // Install workspace dependencies from the project root.
-    // The template uses npm workspaces, so a single root install is enough.
+    // 6. Install dependencies in the background.
+    // The template ships prebuilt `dist-worker/` and `frontend/dist/`, so the
+    // initial create + deploy below does NOT need node_modules. We kick off the
+    // install asynchronously so dependencies are ready for later `pinme save`
+    // and local development, without blocking (or failing) the first create.
+    console.log(chalk.blue('\n4. Installing dependencies in the background...'));
     try {
-      installProjectDependencies(targetDir);
-      console.log(chalk.green('   Project dependencies installed'));
+      const { logPath } = startBackgroundInstall(targetDir);
+      console.log(chalk.gray('   Dependencies are installing in the background; create will continue.'));
+      console.log(chalk.gray(`   Install progress is logged to: ${logPath}`));
+      console.log(chalk.gray('   `pinme save` will automatically wait for this install to finish.'));
     } catch (error: any) {
-      const errorMsg = error.message || '';
-      const installCommand = error instanceof DependencyInstallError
-        ? error.command
-        : 'npm ci/npm install --cache <isolated npm cache> --no-audit --no-fund';
-      
-      // Check for common permission errors
-      if (errorMsg.includes('EACCES') || errorMsg.includes('EPERM') || errorMsg.includes('permission denied')) {
-        throw createCommandError('project dependency install', installCommand, error, [
-          'Permission error detected. Pinme already retries with an isolated npm cache.',
-          'Check whether the project directory is writable:',
-          '  ls -la ' + targetDir,
-          'If npm still reports a root-owned cache, set `npm_config_cache` to a user-writable directory and retry.',
-        ]);
-      }
-      
-      // Check for network errors
-      if (errorMsg.includes('ENOTFOUND') || errorMsg.includes('ETIMEDOUT') || errorMsg.includes('network')) {
-        throw createCommandError('project dependency install', installCommand, error, [
-          'Network error detected. Please check:',
-          '  1. Internet connection is available',
-          '  2. npm registry is accessible (https://registry.npmjs.org)',
-          '  3. Try using a mirror: npm config set registry https://registry.npmmirror.com',
-        ]);
-      }
-      
-      // Generic error
-      throw createCommandError('project dependency install', installCommand, error, [
-        'Dependency installation failed.',
-        'Check network connectivity and npm registry availability.',
-        'Inspect the generated workspace `package.json` files for dependency conflicts.',
-        'If `package-lock.json` is stale, update it intentionally with `npm install` before retrying.',
-      ]);
+      // A failed background install must not block create; the prebuilt dist is enough.
+      console.log(chalk.yellow('   Warning: could not start background dependency install.'));
+      console.log(chalk.yellow('   Run `npm install` inside the project before `pinme save`.'));
     }
 
-    // 7. Build and deploy backend worker
-    console.log(chalk.blue('\n5. Building backend worker...'));
-    try {
-      execSync('npm run build:worker', {
-        cwd: targetDir,
-        stdio: 'inherit',
-      });
-      console.log(chalk.green('   Worker built'));
-    } catch (error: any) {
-      throw createCommandError('worker build', 'npm run build:worker', error, [
-        'Fix the build error shown above, then rerun `pinme create`.',
-      ]);
-    }
+    // 7. Use the prebuilt backend worker shipped with the template
+    console.log(chalk.blue('\n5. Preparing backend worker...'));
 
-    // 8. Get built worker files and SQL files
+    // Get prebuilt worker files and SQL files
     const distWorkerDir = path.join(targetDir, 'dist-worker');
     const workerJsPath = path.join(distWorkerDir, 'worker.js');
-    
+
     if (!fs.existsSync(distWorkerDir) || !fs.existsSync(workerJsPath)) {
-      throw createConfigError('Built worker output not found: `dist-worker/worker.js`.', [
-        'Make sure `npm run build:worker` completed successfully.',
+      throw createConfigError('Prebuilt worker output not found: `dist-worker/worker.js`.', [
+        'The template should ship a prebuilt `dist-worker/`.',
+        'Once dependencies finish installing, run `npm run build:worker` in the project, then `pinme save`.',
       ]);
     }
 
@@ -478,10 +429,7 @@ export default async function createCmd(options: CreateOptions): Promise<void> {
       const formData = new FormData() as any;
 
       // Add metadata
-      const metadataContent = typeof workerData.metadata === 'string'
-        ? workerData.metadata
-        : JSON.stringify(workerData.metadata, null, 2);
-      formData.append('metadata', new Blob([metadataContent], {
+      formData.append('metadata', new Blob([workerMetadataContent], {
         type: 'application/json',
       }), 'metadata.json');
 
@@ -538,27 +486,28 @@ export default async function createCmd(options: CreateOptions): Promise<void> {
       ]);
     }
 
-    // 10. Build and deploy frontend
-    console.log(chalk.blue('\n7. Building frontend...'));
+    // 10. Deploy the prebuilt frontend shipped with the template
+    console.log(chalk.blue('\n7. Preparing frontend...'));
     const frontendDir = path.join(targetDir, 'frontend');
+    const frontendDistDir = path.join(frontendDir, 'dist');
     if (fs.existsSync(frontendDir)) {
-      // Build frontend
-      try {
-        execSync('npm run build:frontend', {
-          cwd: targetDir,
-          stdio: 'inherit',
-        });
-        console.log(chalk.green('   Frontend built'));
-      } catch (error: any) {
-        throw createCommandError('frontend build', 'npm run build:frontend', error, [
-          'Fix the frontend build error shown above, then rerun `pinme create`.',
+      if (!fs.existsSync(frontendDistDir)) {
+        throw createConfigError('Prebuilt frontend output not found: `frontend/dist/`.', [
+          'The template should ship a prebuilt `frontend/dist/`.',
+          'Once dependencies finish installing, run `npm run build:frontend` in the project, then `pinme save`.',
         ]);
       }
+
+      const patchResult = patchPrebuiltFrontendDist(frontendDistDir, workerData);
+      console.log(chalk.green('   Patched prebuilt frontend dist config'));
+      console.log(chalk.gray(
+        `   Replacements: API URL ${patchResult.apiUrlReplacements}, auth ${patchResult.authReplacements}`,
+      ));
 
       // Upload to IPFS and capture the URL
       console.log(chalk.blue('   Uploading to IPFS...'));
       try {
-        const uploadResult = await uploadPath(path.join(frontendDir, 'dist'), {
+        const uploadResult = await uploadPath(frontendDistDir, {
           action: 'project_create',
           projectName: workerData.project_name,
           uid: headers['token-address'],

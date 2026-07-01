@@ -54,6 +54,7 @@ export default async function loginCmd(options: EnvOption = {}): Promise<void> {
     void tracker.trackEvent(TRACK_EVENTS.cliLoginSuccess, TRACK_PAGES.login, {
       a: resolveTrackAction(TRACK_EVENTS.cliLoginSuccess),
       env,
+      source: 'cli',
       has_token_address: true,
       merged_anonymous_history: ok,
     });
@@ -64,6 +65,7 @@ export default async function loginCmd(options: EnvOption = {}): Promise<void> {
     void tracker.trackEvent(TRACK_EVENTS.cliLoginFailed, TRACK_PAGES.login, {
       a: resolveTrackAction(TRACK_EVENTS.cliLoginFailed),
       env,
+      source: 'cli',
       reason: getTrackErrorReason(e),
     });
     console.log(chalk.red(`\nLogin failed: ${e?.message || e}`));
