@@ -76,7 +76,11 @@ async function downloadCarFile(
 
     const writer = fs.createWriteStream(outputPath);
     let downloadedBytes = 0;
-    const totalBytes = parseInt(response.headers['content-length'] || '0', 10);
+    const contentLength = response.headers['content-length'];
+    const totalBytes = parseInt(
+      typeof contentLength === 'string' ? contentLength : '0',
+      10,
+    );
 
     response.data.on('data', (chunk: Buffer) => {
       downloadedBytes += chunk.length;
